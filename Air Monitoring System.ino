@@ -65,8 +65,8 @@ unsigned char pmsbytes[32];
 int pms_pm1 = 0, pms_pm25 = 0, pms_pm10 = 0;
 
 // ============== Wi-Fi(ESP8266 AT Mode) & ThingSpeak ==============
-char ssid[] = "U+Net3AEC";
-char pass[] = "F5A73B6H#F";
+char ssid[] = "Your_SSID";
+char pass[] = "Your_Password";
 const char* thingspeakServer = "api.thingspeak.com";
 const char* apiKey = "3T9AVUGRL8TAOOIZ";  
 
