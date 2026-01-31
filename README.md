@@ -1,5 +1,5 @@
 # 3D Printer IoT Safety System
-
+<img width="1852" height="967" alt="Image" src="https://github.com/user-attachments/assets/343c64a8-7450-4011-9045-496f9dc58979" />
 An **ESP32 DevKitC V4**-based air-quality monitoring node for a home 3D-printer setup (tested with **Bambu Lab P1SC**).  
 It monitors **temperature/humidity, TVOC (scaled VOC Index), formaldehyde (HCHO), CO₂, and particulate matter (PM1.0/PM2.5/PM10)** and uploads the data to **ThingSpeak** for dashboards and mobile notifications.
 
