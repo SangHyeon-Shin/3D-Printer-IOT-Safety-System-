@@ -152,6 +152,9 @@ ESP32 core includes:
 ---
 
 ## Case / enclosure
+|  |  |  |
+|---|---|---|
+| <img width="300" alt="Image" src="https://github.com/user-attachments/assets/3fcf2e9f-58f9-403e-a3fe-984188b8244a" /> | <img width="300" alt="Image" src="https://github.com/user-attachments/assets/4715c162-8c1e-450c-97b7-60d8e0a64c18" /> | <img width="300" alt="Image" src="https://github.com/user-attachments/assets/64ca6098-19f8-4d24-96ca-e4efdb6c4d70" /> |
 
 - Size: **105 mm × 105 mm × 32 mm**
 - Printed in **PLA-HS**
