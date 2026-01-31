@@ -176,17 +176,15 @@ This is convenient for **iOS Shortcuts** or simple scripts.
 
 - Automatic actions:
   - Trigger a smart plug / purifier when thresholds are exceeded
-  - Notify OctoEverywhere / printer workflow when air quality spikes
-- Add:
-  - UFP (ultrafine particle) estimation (requires different sensors)
-  - Better baseline learning (night baseline, smoothing, median filters)
 
 ---
 
 ## License
 
-Choose a license (MIT / Apache-2.0 / GPL-3.0).  
-If you don’t know which one, start with **MIT** for maximum reuse.
+This project is licensed under the MIT License.
+
+Copyright (c) 2026 SangHyeon Shin
+
 
 ---
 
