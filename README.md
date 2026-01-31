@@ -28,31 +28,20 @@ It monitors **temperature/humidity, TVOC (scaled VOC Index), formaldehyde (HCHO)
 ---
 
 ## Data mapping (ThingSpeak fields)
-<table width="100%">
+<table>
   <tr>
-    <td width="33%">
-      <img
-        src="https://github.com/user-attachments/assets/8bf51ecf-3078-443a-881e-afd320313b84"
-        alt="Image"
-        style="width:100%; height:260px; object-fit:cover; display:block;"
-      />
+    <td width="33.33%">
+      <img src="https://github.com/user-attachments/assets/8bf51ecf-3078-443a-881e-afd320313b84" alt="Image" width="100%">
     </td>
-    <td width="33%">
-      <img
-        src="https://github.com/user-attachments/assets/d6a1eb07-cf87-4e16-a80a-c1d1ec46526b"
-        alt="Image"
-        style="width:100%; height:260px; object-fit:cover; display:block;"
-      />
+    <td width="33.33%">
+      <img src="https://github.com/user-attachments/assets/d6a1eb07-cf87-4e16-a80a-c1d1ec46526b" alt="Image" width="100%">
     </td>
-    <td width="33%">
-      <img
-        src="https://github.com/user-attachments/assets/13ab236a-af40-458e-b194-3f15f0d194a6"
-        alt="Image"
-        style="width:100%; height:260px; object-fit:cover; display:block;"
-      />
+    <td width="33.33%">
+      <img src="https://github.com/user-attachments/assets/13ab236a-af40-458e-b194-3f15f0d194a6" alt="Image" width="100%">
     </td>
   </tr>
 </table>
+
 
 
 | Field | Metric | Unit / notes |
