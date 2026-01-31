@@ -28,20 +28,17 @@ It monitors **temperature/humidity, TVOC (scaled VOC Index), formaldehyde (HCHO)
 ---
 
 ## Data mapping (ThingSpeak fields)
+<img width="511" height="625" alt="Image" src="https://github.com/user-attachments/assets/d6a1eb07-cf87-4e16-a80a-c1d1ec46526b" />
 <table>
   <tr>
     <td>
       <img alt="Image" src="https://github.com/user-attachments/assets/8bf51ecf-3078-443a-881e-afd320313b84" width="100%">
     </td>
     <td>
-      <img alt="Image" src="https://github.com/user-attachments/assets/d6a1eb07-cf87-4e16-a80a-c1d1ec46526b" width="100%">
-    </td>
-    <td>
       <img alt="Image" src="https://github.com/user-attachments/assets/13ab236a-af40-458e-b194-3f15f0d194a6" width="100%">
     </td>
   </tr>
 </table>
-
 | Field | Metric | Unit / notes |
 |---:|---|---|
 | field1 | Temperature | °C |
