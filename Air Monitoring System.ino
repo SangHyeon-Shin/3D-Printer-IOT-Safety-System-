@@ -1,444 +1,368 @@
-//*******************************************************
-// [Arduino Mega + ESP-01(AT) + Multiple Sensors + ThingSpeak + TFT LCD]
-//
-// Sensor List:
-//  (1) DHT22         (Pin 2)
-//  (2) DF Robot HCHO (SoftwareSerial Pin 10)
-//  (3) SGP30         (I2C SDA-SCL)
-//  (4) ZE16B-CO      (Hardware Serial1: RX1=19, TX1=18)
-//  (5) MH-Z16        (SoftwareSerial: RX=11, TX=12)
-//  (6) PMS7003       (Hardware Serial2: RX2=17, TX2=16)
-//
-// TFT LCD (ST7796S-based) Pin Information:
-//  LCDWIKI_SPI mylcd(ST7796S,A5,A3,50,51,A4,52,A0);
-//   - Model: ST7796S
-//   - CS: A5
-//   - DC(CD): A3 
-//   - MISO: 50
-//   - MOSI: 51
-//   - RESET: A4
-//   - CLK: 52
-//   - LED (Backlight): A0
-//
-// Sensor Values to Display:
-//  - Temperature/Humidity (DHT22)
-//  - HCHO (DF Robot)
-//  - TVOC (SGP30)
-//  - CO (ZE16B)
-//  - CO2 (MH-Z16)
-//  - PM1.0 / PM2.5 / PM10 (PMS7003)
-//
-// Example ThingSpeak Field Mapping:
-//   field1: Temperature, field2: Humidity, field3: TVOC, field4: CO,
-//   field5: CO2, field6: PM1.0, field7: PM2.5, field8: PM10
-//*******************************************************
-
-// ============== Libraries ==============
 #include <Arduino.h>
 #include <Wire.h>
-#include <SoftwareSerial.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
 
-// DHT22 (Temperature/Humidity Sensor)
-#include "DHT.h"
-#define DHTPIN 2
-#define DHTTYPE DHT22
-DHT dht(DHTPIN, DHTTYPE);
+#include <DFRobotHCHOSensor.h>
 
-// SGP30 (I2C)
-#include "SparkFun_SGP30_Arduino_Library.h"
-SGP30 mySensor;
+#include <SensirionI2CSgp41.h>
+#include <SensirionI2cSht4x.h>
+#include <VOCGasIndexAlgorithm.h>
 
-// ZE16B-CO (Serial1)
-uint8_t getppm[] = {0xFF, 0x01, 0x86, 0x00, 0x00, 0x00, 0x00, 0x00, 0x79};
-unsigned char dataZe16b[9];
-int ze16b_CO = 0;
+#include "PMS.h"
 
-// MH-Z16 (SoftwareSerial)
-#include <Mhz16.h>
-Mhz16 mhz16(11, 12); // RX=11, TX=12
-
-// PMS7003 (Serial2)
-#define HEAD_1 0x42
-#define HEAD_2 0x4D
-#define PMS7003_BAUD_RATE 9600
-unsigned char pmsbytes[32];
-int pms_pm1 = 0, pms_pm25 = 0, pms_pm10 = 0;
-
-// ============== Wi-Fi(ESP8266 AT Mode) & ThingSpeak ==============
-char ssid[] = "Your_SSID";
-char pass[] = "Your_Password";
+// =====================
+// ThingSpeak / WiFi (그대로 유지)
+// =====================
+char ssid[] = "U+Net3AEC";
+char pass[] = "F5A73B6H#F";
 const char* thingspeakServer = "api.thingspeak.com";
-const char* apiKey = "3T9AVUGRL8TAOOIZ";  
+const char* apiKey = "3T9AVUGRL8TAOOIZ";
 
+// ThingSpeak 제한 고려: 15초 이상 권장 -> 20초
+static const uint32_t UPLOAD_INTERVAL_MS = 20000;
+static uint32_t lastUploadMs = 0;
 
-#define ESP8266_BAUD 115200
+// =====================
+// I2C (SHT41 + SGP41)
+// =====================
+static const int I2C_SDA = 19;
+static const int I2C_SCL = 22;
+static const uint8_t SHT4X_ADDR = 0x44;
 
-bool sendATCommand(const String &cmd, const String &expectedResponse, unsigned long timeout = 5000) {
-  Serial3.println(cmd);
-  unsigned long start = millis();
-  String response = "";
-  while (millis() - start < timeout) {
-    if (Serial3.available()) {
-      response += Serial3.readString();
-      if (response.indexOf(expectedResponse) != -1) {
-        return true;
-      }
-    }
-  }
-  Serial.println("AT command failed: " + cmd);
-  Serial.println("Response: " + response);
-  return false;
-}
+SensirionI2CSgp41 sgp41;
+SensirionI2cSht4x sht4x;
+VOCGasIndexAlgorithm vocAlgo;
 
-bool validateChecksum(unsigned char *data, int length) {
-  unsigned char checksum = 0;
-  for (int i = 1; i < length - 1; i++) {
-    checksum += data[i];
-  }
-  checksum = 0xFF - checksum + 1;
-  return (checksum == data[length - 1]);
-}
+// =====================
+// HCHO (UART2)
+// =====================
+static const int HCHO_RX = 16;   // 센서 TX -> ESP32 RX2
+static const int HCHO_TX = 17;   // (옵션) ESP32 TX2 -> 센서 RX
+HardwareSerial HCHO(2);
+DFRobotHCHOSensor hchoSensor(&HCHO);
 
-bool receiveResponse(unsigned char *buffer, int length) {
-  int index = 0;
-  unsigned long startTime = millis();
-  while ((millis() - startTime) < 1000) {
-    if (Serial1.available() > 0) {
-      buffer[index] = Serial1.read();
-      index++;
-      if (index == length) {
-        return true;
-      }
-    }
-  }
-  return false;
-}
+static bool  hasHcho = false;
+static float lastHchoPpb = NAN;
 
-void updateThingSpeak(float temp, float hum, float tvoc, int co_ppm, int co2, int pm1, int pm25, int pm10) {
-  String getRequest = "GET /update?api_key=";
-  getRequest += apiKey;
-  // field1~8 Mapping
-  getRequest += "&field1=" + String(temp);
-  getRequest += "&field2=" + String(hum);
-  getRequest += "&field3=" + String(tvoc);
-  getRequest += "&field4=" + String(co_ppm);
-  getRequest += "&field5=" + String(co2);
-  getRequest += "&field6=" + String(pm1);
-  getRequest += "&field7=" + String(pm25);
-  getRequest += "&field8=" + String(pm10);
+// =====================
+// PMS7003 (UART1, Passive)
+// =====================
+static const int PMS_RX = 4;  // PMS TXD -> ESP32 RX1
+static const int PMS_TX = 5;  // PMS RXD -> ESP32 TX1
+HardwareSerial pmsSerial(1);
+PMS pms(pmsSerial);
+PMS::DATA pmsData;
 
-  String httpRequest = getRequest + " HTTP/1.1\r\nHost: ";
-  httpRequest += thingspeakServer;
-  httpRequest += "\r\nConnection: close\r\n\r\n";
+static bool hasPms = false;
+static PMS::DATA lastPmsData;
 
-  Serial.println("ThingSpeak 전송 요청:");
-  Serial.println(httpRequest);
+static const uint32_t PMS_INTERVAL_MS = 5000;  // 5초마다 1회 요청
+static const uint32_t PMS_WAIT_MS     = 900;   // 요청 후 최대 0.9초 동안 수신 시도
+static uint32_t pmsLastReqMs = 0;
+static uint32_t pmsReqStartMs = 0;
+static bool pmsWaiting = false;
 
-  // 1. TCP Connect
-  if (!sendATCommand("AT+CIPSTART=\"TCP\",\"" + String(thingspeakServer) + "\",80", "CONNECT", 8000)) {
-    Serial.println("TCP 연결 실패");
-    return;
-  }
+// =====================
+// MH-Z16 (PWM)
+// =====================
+static const int CO2_PWM_PIN = 33;          // MH-Z16 PWM -> GPIO33
+static const int CO2_FULL_SCALE_PPM = 5000; // 센서 범위(2000/5000/10000 등)로 수정
 
-  // 2. Send data length
-  int length = httpRequest.length();
-  if (!sendATCommand("AT+CIPSEND=" + String(length), ">", 5000)) {
-    Serial.println("CIPSEND 명령 실패");
-    return;
-  }
+volatile uint32_t co2LastRiseUs = 0;
+volatile uint32_t co2PeriodUs = 0;
+volatile uint32_t co2HighUs = 0;
 
-  // 3. Send HTTP request data
-  Serial3.print(httpRequest);
-  unsigned long timeout = millis() + 5000;
-  while (millis() < timeout) {
-    if (Serial3.available()) {
-      String response = Serial3.readString();
-      Serial.println("응답: " + response);
-      break;
-    }
-  }
+static bool hasCo2 = false;
+static int  lastCo2Ppm = -1;
 
-  // 4. Close TCP connection
-  closeTCPConnection();
-}
+void IRAM_ATTR onCo2PwmChange() {
+  uint32_t now = micros();
+  int level = digitalRead(CO2_PWM_PIN);
 
-bool closeTCPConnection() {
-  Serial3.println("AT+CIPCLOSE");
-  unsigned long startTime = millis();
-  String response = "";
-  while (millis() - startTime < 3000) {
-    if (Serial3.available()) {
-      response += Serial3.readString();
-      if (response.indexOf("OK") != -1) {
-        return true; // Successfully closed
-      } else if (response.indexOf("ERROR") != -1) {
-        Serial.println("TCP connection already closed or error");
-        return false;
-      }
-    }
-  }
-  Serial.println("No response to AT+CIPCLOSE command");
-  return false;
-}
-
-// ============== LCD Library ==============
-#include <LCDWIKI_GUI.h> 
-#include <LCDWIKI_SPI.h> 
-
-// Create LCD object (Software SPI example)
-LCDWIKI_SPI mylcd(ST7796S, A5, A3, 50, 51, A6, 52, A0);
-
-// Color Definitions
-#define BLACK   0x0000
-#define BLUE    0x001F
-#define RED     0xF800
-#define GREEN   0x07E0
-#define ORANGE  0xFD20
-#define CYAN    0x07FF
-#define MAGENTA 0xF81F
-#define YELLOW  0xFFE0
-#define WHITE   0xFFFF
-
-// ============== Global Variables (Sensor Data Storage) ==============
-float dht_temperature = 0, dht_humidity = 0;
-float tvoc_ppb = 0;
-uint16_t co2_sgp30 = 0;
-int co2_mhz16 = 0;
-
-// ThingSpeak Timer (Ex: 20s)
-unsigned long tsTimer = 0;
-const unsigned long tsInterval = 20000; 
-
-void setup() {
-  // Basic Serial
-  Serial.begin(115200);
-  while (!Serial) { ; }
-  Serial.println("=== Setup Start ===");
-
-  // Sensor Serial Reset
-  Serial1.begin(9600);          // ZE16B-CO
-  mhz16.begin(9600);            // MH-Z16
-  Serial2.begin(PMS7003_BAUD_RATE); // PMS7003
-  
-  dht.begin(); // DHT22
-  
-  // SGP30 (I2C)
-  Wire.begin();
-  if (!mySensor.begin()) {
-    Serial.println("SGP30 Connection Failed");
-    while (1);
-  }
-  mySensor.initAirQuality();
-
-  // ESP8266 (Serial3)
-  Serial3.begin(ESP8266_BAUD);
-  delay(2000);
-
-  // Connect ESP8266 Wi-Fi 
-  if (sendATCommand("AT", "OK", 2000)) {
-    Serial.println("ESP8266 Communication OK");
-  }
-  if (sendATCommand("AT+CWMODE=1", "OK", 2000)) {
-    Serial.println("Wi-Fi Mode STA Setting Completed");
-  }
-  String cmd = "AT+CWJAP=\"" + String(ssid) + "\",\"" + String(pass) + "\"";
-  if (sendATCommand(cmd, "WIFI GOT IP", 15000)) {
-    Serial.println("Wi-Fi Connect Success");
+  if (level == HIGH) {
+    if (co2LastRiseUs != 0) co2PeriodUs = now - co2LastRiseUs;
+    co2LastRiseUs = now;
   } else {
-    Serial.println("Wi-Fi Connect Failed");
+    if (co2LastRiseUs != 0) co2HighUs = now - co2LastRiseUs;
+  }
+}
+
+// =====================
+// Timing (SGP41 1Hz)
+// =====================
+static const uint32_t SAMPLE_MS = 1000;
+static uint32_t lastTick = 0;
+static uint32_t t0 = 0;
+
+// =====================
+// Latest cache (업로드용)
+// =====================
+static float lastTempC = NAN;
+static float lastRhPct = NAN;
+static int   lastVocIndex = -1;   // field3에 업로드(=TVOC 역할)
+static int   lastPm1 = -1, lastPm25 = -1, lastPm10 = -1;
+
+// =====================
+// Helpers
+// =====================
+static uint16_t rhToTicks(float rh_percent) {
+  if (rh_percent < 0) rh_percent = 0;
+  if (rh_percent > 100) rh_percent = 100;
+  return (uint16_t)(rh_percent * 65535.0f / 100.0f + 0.5f);
+}
+
+static uint16_t tToTicks(float t_c) {
+  if (t_c < -45) t_c = -45;
+  if (t_c > 130) t_c = 130;
+  return (uint16_t)((((t_c + 45.0f) * 65535.0f) / 175.0f) + 0.5f);
+}
+
+// PMS 패시브 요청 + 논블로킹 수신 시도
+static void pmsTask() {
+  uint32_t now = millis();
+
+  if (!pmsWaiting && (now - pmsLastReqMs >= PMS_INTERVAL_MS)) {
+    while (pmsSerial.available()) pmsSerial.read();
+    pms.requestRead();
+    pmsWaiting = true;
+    pmsReqStartMs = now;
+    pmsLastReqMs = now;
   }
 
-  // TFT LCD Reset
-  mylcd.Init_LCD();
-  mylcd.Fill_Screen(BLACK);
-  
-  Serial.println("=== Setup End ===");
+  if (pmsWaiting) {
+    if (pms.read(pmsData)) {
+      lastPmsData = pmsData;
+      hasPms = true;
+      pmsWaiting = false;
+
+      // 업로드 캐시 갱신
+      lastPm1  = (int)lastPmsData.PM_AE_UG_1_0;
+      lastPm25 = (int)lastPmsData.PM_AE_UG_2_5;
+      lastPm10 = (int)lastPmsData.PM_AE_UG_10_0;
+    } else if (now - pmsReqStartMs > PMS_WAIT_MS) {
+      pmsWaiting = false;
+    }
+  }
+}
+
+// CO2(PWM) 캡처값을 ppm으로 변환해서 캐시(1초마다 호출 권장)
+static void co2UpdateOncePerSecond() {
+  uint32_t pUs, hUs;
+  noInterrupts();
+  pUs = co2PeriodUs;
+  hUs = co2HighUs;
+  interrupts();
+
+  if (pUs < 900000 || pUs > 1100000 || hUs == 0) {
+    hasCo2 = false;
+    lastCo2Ppm = -1;
+    return;
+  }
+
+  float pMs = pUs / 1000.0f;
+  float hMs = hUs / 1000.0f;
+  float lMs = pMs - hMs;
+
+  float denom = (hMs + lMs - 4.0f);
+  float ppm = (denom > 0.0f) ? (CO2_FULL_SCALE_PPM * (hMs - 2.0f) / denom) : -1.0f;
+
+  if (ppm < 0) ppm = 0;
+  if (ppm > CO2_FULL_SCALE_PPM) ppm = CO2_FULL_SCALE_PPM;
+
+  lastCo2Ppm = (int)lroundf(ppm);
+  hasCo2 = true;
+}
+
+// =====================
+// WiFi + ThingSpeak
+// =====================
+static void ensureWiFi() {
+  if (WiFi.status() == WL_CONNECTED) return;
+
+  Serial.print("WiFi connecting to ");
+  Serial.println(ssid);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, pass);
+
+  uint32_t tStart = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - tStart < 15000) {
+    delay(300);
+    Serial.print(".");
+  }
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("WiFi OK, IP=");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("WiFi connect failed (will retry)");
+  }
+}
+
+static void uploadThingSpeak() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  // 유효하지 않은 값은 -1로 업로드(그래프에서 결측치처럼 처리하기 쉬움)
+  float fTemp = isnan(lastTempC) ? -1.0f : lastTempC;
+  float fHum  = isnan(lastRhPct) ? -1.0f : lastRhPct;
+
+  int tvoc = (lastVocIndex < 0) ? -1 : lastVocIndex; // field3
+  int hcho = (!hasHcho || isnan(lastHchoPpb)) ? -1 : (int)lroundf(lastHchoPpb);
+  int co2  = (!hasCo2 || lastCo2Ppm < 0) ? -1 : lastCo2Ppm;
+
+  int pm1  = (lastPm1  < 0) ? -1 : lastPm1;
+  int pm25 = (lastPm25 < 0) ? -1 : lastPm25;
+  int pm10 = (lastPm10 < 0) ? -1 : lastPm10;
+
+  String url = String("http://") + thingspeakServer + "/update?api_key=" + apiKey
+             + "&field1=" + String(fTemp, 2)
+             + "&field2=" + String(fHum, 2)
+             + "&field3=" + String(tvoc/5)
+             + "&field4=" + String(hcho)
+             + "&field5=" + String(co2)
+             + "&field6=" + String(pm1)
+             + "&field7=" + String(pm25)
+             + "&field8=" + String(pm10);
+
+  HTTPClient http;
+  http.begin(url);
+
+  int httpCode = http.GET();
+  if (httpCode > 0) {
+    String payload = http.getString(); // 성공 시 entry id(숫자) 반환이 보통
+    Serial.print("ThingSpeak HTTP ");
+    Serial.print(httpCode);
+    Serial.print(", resp=");
+    Serial.println(payload);
+  } else {
+    Serial.print("ThingSpeak HTTP failed, code=");
+    Serial.println(httpCode);
+  }
+  http.end();
+}
+
+// =====================
+// Setup / Loop
+// =====================
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+
+  // WiFi
+  ensureWiFi();
+
+  // ---- UART2 (HCHO) ----
+  HCHO.begin(9600, SERIAL_8N1, HCHO_RX, HCHO_TX);
+
+  // ---- UART1 (PMS7003) ----
+  pmsSerial.begin(9600, SERIAL_8N1, PMS_RX, PMS_TX);
+  pms.passiveMode();
+
+  // ---- I2C ----
+  Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.setClock(400000);
+  sht4x.begin(Wire, SHT4X_ADDR);
+  sgp41.begin(Wire);
+
+  // ---- CO2 PWM ----
+  pinMode(CO2_PWM_PIN, INPUT);
+  attachInterrupt(digitalPinToInterrupt(CO2_PWM_PIN), onCo2PwmChange, CHANGE);
+
+  Serial.println();
+  Serial.println("Output: T(C), RH(%), VOC_Index->field3, HCHO(ppb), CO2(ppm), PM(ug/m3)");
+  Serial.println("SGP41 warmup: first 10 seconds conditioning.");
+  Serial.println("PMS7003: passive request every 5 seconds.");
+  Serial.println("ThingSpeak: upload every 20 seconds.");
 }
 
 void loop() {
-  // (1) DHT22 Sensor (Temp,Humi) 2s Cycle
-  static unsigned long dhtTimer = 0;
-  if (millis() - dhtTimer >= 2000) {
-    dhtTimer = millis();
-    float h = dht.readHumidity()+10;
-    float t = dht.readTemperature()-4.5;
-    if (!isnan(h) && !isnan(t)) {
-      dht_humidity = h;
-      dht_temperature = t;
-      Serial.print("[DHT22] Humi: ");
-      Serial.print(h);
-      Serial.print("%, Temp: ");
-      Serial.println(t);
+  // (0) WiFi 유지
+  ensureWiFi();
+
+  // (A) HCHO UART: 들어오면 즉시 마지막값 갱신
+  if (hchoSensor.available()) {
+    float ppm = hchoSensor.uartReadPPM();
+    lastHchoPpb = ppm * 1000.0f; // ppm -> ppb
+    hasHcho = true;
+  }
+
+  // (B) PMS7003 패시브 태스크
+  pmsTask();
+
+  // (C) 1초 틱
+  uint32_t now = millis();
+  if (now - lastTick < SAMPLE_MS) {
+    // 업로드 타이밍은 loop에서 따로 체크
+  } else {
+    lastTick = now;
+
+    if (t0 == 0) t0 = now;
+    uint32_t elapsed_s = (now - t0) / 1000;
+
+    // (D) CO2 업데이트(1초마다)
+    co2UpdateOncePerSecond();
+
+    // ---- SHT41 ----
+    float t = NAN, rh = NAN;
+    uint16_t err = sht4x.measureHighPrecision(t, rh);
+    if (!err) {
+      lastTempC = t;
+      lastRhPct = rh;
     } else {
-      Serial.println("[DHT22] Data reading Failed");
+      Serial.print("ERR SHT4x=");
+      Serial.println(err);
     }
-  }
 
-  // (2) MHZ16 
-  static unsigned long sensorTimer = 0;
-if (millis() - sensorTimer >= 1000) {
-  sensorTimer = millis();
-    int c = mhz16.readGasConcentration();
-    if (c > 0) {
-      co2_mhz16 = c;
-    }
-    Serial.print("[MH-Z16] CO2 ppm: ");
-    Serial.println(co2_mhz16);
-  
-}
+    // SHT 값이 유효할 때만 SGP41에 보정값 넣기
+    if (!isnan(lastTempC) && !isnan(lastRhPct)) {
+      uint16_t rhTicks = rhToTicks(lastRhPct);
+      uint16_t tTicks  = tToTicks(lastTempC);
 
-  // (3) SGP30 (TVOC, CO2) 1s Cycle
-  static unsigned long sgpTimer = 0;
-  if (millis() - sgpTimer >= 1000) {
-    sgpTimer = millis();
-    mySensor.measureAirQuality();
-    tvoc_ppb  = mySensor.TVOC;
-    co2_sgp30 = mySensor.CO2;
-    Serial.print("[SGP30] TVOC: ");
-    Serial.println(tvoc_ppb);
-  }
-
-  // (4) ZE16B-CO Sensor (CO) 1s Cycle
-  static unsigned long coTimer = 0;
-  if (millis() - coTimer >= 1000) {
-    coTimer = millis();
-    Serial1.write(getppm, sizeof(getppm));
-    Serial1.flush();
-    if (receiveResponse(dataZe16b, 9)) {
-      if (validateChecksum(dataZe16b, 9)) {
-        ze16b_CO = (dataZe16b[2] << 8) | dataZe16b[3];
-        if (ze16b_CO > 100)
-        { 
-          ze16b_CO = 0;
-          Serial.print("[ZE16B] CO Sensor Error");
+      if (elapsed_s < 10) {
+        uint16_t srawVoc = 0;
+        err = sgp41.executeConditioning(rhTicks, tTicks, srawVoc);
+        if (err) {
+          Serial.print("ERR SGP41(cond)=");
+          Serial.println(err);
         }
-        Serial.print("[ZE16B] CO ppm: ");
-        Serial.println(ze16b_CO);
+        lastVocIndex = -1; // 워밍업 동안은 업로드-출력에서 - 처리
       } else {
-        Serial.println("[ZE16B] Checksum Error");
-      }
-    } else {
-      Serial.println("[ZE16B] No response");
-    }
-  }
-
-
-  // (6) PMS7003 (PM1.0, PM2.5, PM10) 1s Cycle
-  if (Serial2.available() >= 32) {
-    int i = 0;
-    for (i = 0; i < 32; i++) {
-      pmsbytes[i] = Serial2.read();
-      if ((i == 0 && pmsbytes[0] != HEAD_1) ||
-          (i == 1 && pmsbytes[1] != HEAD_2)) {
-        break;
+        uint16_t srawVoc = 0, srawNox = 0;
+        err = sgp41.measureRawSignals(rhTicks, tTicks, srawVoc, srawNox);
+        if (!err) {
+          lastVocIndex = (int)vocAlgo.process(srawVoc);
+        } else {
+          Serial.print("ERR SGP41(meas)=");
+          Serial.println(err);
+        }
       }
     }
-    // Normal Data(32 bytes)
-    if (i > 2 && pmsbytes[29] == 0x00 && pms_pm1<1000 && pms_pm25 < 1000 && pms_pm10 < 1000) {
-      pms_pm1  = (pmsbytes[10] << 8) | pmsbytes[11];
-      pms_pm25 = (pmsbytes[12] << 8) | pmsbytes[13];
-      pms_pm10 = (pmsbytes[14] << 8) | pmsbytes[15];
-      Serial.print("[PMS7003] PM1.0: ");
-      Serial.print(pms_pm1);
-      Serial.print(", PM2.5: ");
-      Serial.print(pms_pm25);
-      Serial.print(", PM10: ");
-      Serial.println(pms_pm10);
-    }
+
+    // ---- Serial print(디버그) ----
+    Serial.print("T=");
+    Serial.print(isnan(lastTempC) ? -1 : lastTempC, 2);
+    Serial.print(" C, RH=");
+    Serial.print(isnan(lastRhPct) ? -1 : lastRhPct, 2);
+    Serial.print(" %, TVOC(VOC_Index)=");
+    Serial.print(lastVocIndex/5);
+    Serial.print(", HCHO=");
+    Serial.print((!hasHcho || isnan(lastHchoPpb)) ? -1 : (int)lroundf(lastHchoPpb));
+    Serial.print(" ppb, CO2=");
+    Serial.print((!hasCo2 || lastCo2Ppm < 0) ? -1 : lastCo2Ppm);
+    Serial.print(" ppm, PM1.0=");
+    Serial.print(lastPm1);
+    Serial.print(" ug/m3, PM2.5=");
+    Serial.print(lastPm25);
+    Serial.print(" ug/m3, PM10=");
+    Serial.print(lastPm10);
+    Serial.println(" ug/m3");
   }
 
-  // === Sensor Value on TFT LCD ===
-
-  static unsigned long lcdTimer = 0;
-if (millis() - lcdTimer >= 2000) {
-    lcdTimer = millis();
-
-    mylcd.Set_Text_Mode(0);
-    mylcd.Set_Text_Back_colour(BLACK);
-    mylcd.Set_Text_Size(2);
-
-    int yBase = 20;
-    int gap   = 60;
-
-    // 1) Temp
-    int tempX = 120, tempY = yBase;
-    mylcd.Set_Text_colour(getColor(dht_temperature, 18, 26, 15, 30));
-    mylcd.Fill_Rect(tempX, tempY - 5, tempX + 100, tempY + 20, BLACK);
-    mylcd.Print_String("Temp: ", 10, tempY);
-    mylcd.Print_Number_Float(dht_temperature, 1, tempX, tempY, '.', 0, ' ');
-    mylcd.Print_String("C", 200, tempY);
-
-    // 2) Humi
-    int humidX = 120, humidY = yBase + gap;
-    mylcd.Set_Text_colour(getColor(dht_humidity, 40, 60, 30, 70));
-    mylcd.Fill_Rect(humidX, humidY - 5, humidX + 100, humidY + 20, BLACK);
-    mylcd.Print_String("Humid: ", 10, humidY);
-    mylcd.Print_Number_Float(dht_humidity, 1, humidX, humidY, '.', 0, ' ');
-    mylcd.Print_String("%", 200, humidY);
-
-    // 3) TVOC
-    int tvocX = 120, tvocY = yBase + gap * 2;
-    mylcd.Set_Text_colour(getColor(tvoc_ppb, 0, 220, 221, 660));
-    mylcd.Fill_Rect(tvocX, tvocY - 5, tvocX + 100, tvocY + 20, BLACK);
-    mylcd.Print_String("TVOC: ", 10, tvocY);
-    mylcd.Print_Number_Int((int)tvoc_ppb, tvocX, tvocY, 0, ' ', 10);
-    mylcd.Print_String(" ppb", 200, tvocY);
-
-    // 4) CO
-    int coX = 120, coY = yBase + gap * 3;
-    mylcd.Set_Text_colour(getColor(ze16b_CO, 0, 9, 10, 34));
-    mylcd.Fill_Rect(coX, coY - 5, coX + 100, coY + 20, BLACK);
-    mylcd.Print_String("CO: ", 10, coY);
-    mylcd.Print_Number_Int(ze16b_CO, coX, coY, 0, ' ', 10);
-    mylcd.Print_String(" ppm", 200, coY);
-
-    // 5) CO2
-    int co2X = 120, co2Y = yBase + gap * 4;
-    mylcd.Set_Text_colour(getColor(co2_mhz16, 0, 1000, 1001, 2000));
-    mylcd.Fill_Rect(co2X, co2Y - 5, co2X + 100, co2Y + 20, BLACK);
-    mylcd.Print_String("CO2: ", 10, co2Y);
-    mylcd.Print_Number_Int(co2_mhz16, co2X, co2Y, 0, ' ', 10);
-    mylcd.Print_String(" ppm", 200, co2Y);
-
-
-    // 7) PM1.0
-    int pm1X = 120, pm1Y = yBase + gap * 5;
-    mylcd.Set_Text_colour(getColor(pms_pm1, 0, 15, 16, 35));
-    mylcd.Fill_Rect(pm1X, pm1Y - 5, pm1X + 100, pm1Y + 20, BLACK);
-    mylcd.Print_String("PM1.0: ", 10, pm1Y);
-    mylcd.Print_Number_Int(pms_pm1, pm1X, pm1Y, 0, ' ', 10);
-    mylcd.Print_String(" ug/m^3", 200, pm1Y);
-
-    // 8) PM2.5
-    int pm25X = 120, pm25Y = yBase + gap * 6;
-    mylcd.Set_Text_colour(getColor(pms_pm25, 0, 15, 16, 35));
-    mylcd.Fill_Rect(pm25X, pm25Y - 5, pm25X + 100, pm25Y + 20, BLACK);
-    mylcd.Print_String("PM2.5: ", 10, pm25Y);
-    mylcd.Print_Number_Int(pms_pm25, pm25X, pm25Y, 0, ' ', 10);
-    mylcd.Print_String(" ug/m^3", 200, pm25Y);
-
-    // 9) PM10
-    int pm10X = 120, pm10Y = yBase + gap * 7;
-    mylcd.Set_Text_colour(getColor(pms_pm10, 0, 15, 16, 35));
-    mylcd.Fill_Rect(pm10X, pm10Y - 5, pm10X + 100, pm10Y + 20, BLACK);
-    mylcd.Print_String("PM10 : ", 10, pm10Y);
-    mylcd.Print_Number_Int(pms_pm10, pm10X, pm10Y, 0, ' ', 10);
-    mylcd.Print_String(" ug/m^3", 200, pm10Y);
-}
-
-
-
-  // === ThingSpeak Sending (20s Cycle) ===
-  if (millis() - tsTimer >= tsInterval) {
-    tsTimer = millis();
-    // dht_temperature, dht_humidity, tvoc_ppb, ze16b_CO, co2_mhz16, pms_pm1, pms_pm25, pms_pm10
-    updateThingSpeak(dht_temperature, dht_humidity, tvoc_ppb, ze16b_CO,
-                     co2_mhz16, pms_pm1, pms_pm25, pms_pm10);
+  // (D) ThingSpeak 업로드(20초마다)
+  if (millis() - lastUploadMs >= UPLOAD_INTERVAL_MS) {
+    lastUploadMs = millis();
+    uploadThingSpeak();
   }
-}
-
-uint16_t getColor(float value, float safeMin, float safeMax, float warningMin, float warningMax) {
-    if (value >= safeMin && value <= safeMax) return GREEN;    // Safe
-    if (value >= warningMin && value <= warningMax) return ORANGE; // Caution
-    return RED;                                                // Warning
 }
