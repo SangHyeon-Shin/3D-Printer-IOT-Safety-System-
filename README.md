@@ -79,7 +79,11 @@ It monitors **temperature/humidity, TVOC (scaled VOC Index), formaldehyde (HCHO)
 
 > **Voltage-level caution**  
 > Many PMS7003 / ZE08 modules use **3.3 V UART logic** even when powered by 5 V, but variants exist.  
-> If your module outputs **5 V TTL**, use a **level shifter** or a resistor divider into ESP32 RX pins.
+> If your module outputs **5 V TTL**, use a **level shifter** or a resistor divider into ESP32 RX pins.  
+> Check the **PWM output level of your MH-Z16** module the same way before wiring it to GPIO33.
+
+> **Module-variant caution**  
+> DevKitC V4 boards ship with either a WROOM or a **WROVER** module. On WROVER (PSRAM) modules, **GPIO16/17 are used by the PSRAM** and cannot serve as UART2 — use a WROOM-based board or move the ZE08 UART to free pins.
 
 | Device | Power | ESP32 Pins |
 |---|---|---|
@@ -206,7 +210,7 @@ ESP32 core includes:
 
 
 
-- Size: **105 mm × 105 mm × 32 mm**
+- Size: **125 mm × 125 mm × 32 mm** body + **2 mm** lid (measured from the CAD files; 5.5 mm walls)
 - Printed in **PLA-HS**
 - Ventilation: multiple **3 mm holes** on 5 sides (bottom solid)
 
@@ -234,7 +238,7 @@ This is convenient for **iOS Shortcuts** or simple scripts.
 
 ## License
 
-This project is licensed under the MIT License.
+This project is licensed under the MIT License — see [LICENSE](LICENSE).
 
 Copyright (c) 2026 SangHyeon Shin
 
