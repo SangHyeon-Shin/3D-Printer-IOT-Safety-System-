@@ -233,6 +233,7 @@ This is convenient for **iOS Shortcuts** or simple scripts.
 
 - Automatic actions:
   - Trigger a smart plug / purifier when thresholds are exceeded
+- **V3 plan** (source + room measurement, ultrafine-particle indicator, CO + thermal fire signs, local alarm, per-print emission reports): see [docs/V3_PLAN.md](docs/V3_PLAN.md)
 
 ---
 
