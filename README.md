@@ -12,14 +12,17 @@ It monitors **temperature/humidity, TVOC (scaled VOC Index), formaldehyde (HCHO)
 
 ## Features
 
-- **Sensors (multi-sensor fusion, non-blocking loop)**
+- **Sensors (1 Hz sampling; SHT41 temperature/humidity compensates the SGP41)**
   - Temp & RH: **SHT41 (SHT4x)**
   - TVOC proxy: **SGP41 VOC Index** *(scaled ÷5 to fit 0–100 range)*
   - Formaldehyde: **ZE08-CH2O** (UART)
   - CO₂: **MH-Z16** (PWM output)
   - Dust / PM: **PMS7003** (UART, **passive mode** request)
+- **Data quality**
+  - A reading is used only while it is fresh; an unplugged or failing sensor drops out of the upload instead of repeating its last value
+  - Wi-Fi reconnects in the background, so sampling continues while the network is down (each HTTPS upload still blocks the loop briefly)
 - **Cloud**
-  - Upload to **ThingSpeak** every **20 s** (ThingSpeak free-tier minimum interval)
+  - Upload to **ThingSpeak** over **HTTPS** every **20 s** (free accounts allow one update per channel every 15 s)
 - **Mobile / Automation**
   - Works well with **ThingsView / ThingSpeak dashboards**
   - Easy to read latest values from `.../fields/<n>/last.json` in **iOS Shortcuts**, Home automation, etc.
@@ -55,6 +58,10 @@ It monitors **temperature/humidity, TVOC (scaled VOC Index), formaldehyde (HCHO)
 | field6 | PM1.0 | µg/m³ |
 | field7 | PM2.5 | µg/m³ |
 | field8 | PM10 | µg/m³ |
+
+- A field without a fresh, valid reading (sensor warming up, unplugged or failing) is **left out** of the update, so ThingSpeak stores an empty value instead of a placeholder number.
+- field3 appears about **1 minute after boot**: 10 s of SGP41 conditioning plus the 45 s start-up blackout of the VOC algorithm.
+- Channel history: in v1 (Arduino Mega, 2025-01) field3 was SGP30 TVOC in ppb and field4 was CO in ppm. If the same channel is reused, those two fields are not comparable across the firmware change.
 
 ---
 
@@ -124,21 +131,26 @@ If the serial log shows `ThingSpeak HTTPS failed`, ThingSpeak may have changed i
   ```cpp
   static const int CO2_FULL_SCALE_PPM = 5000;
   ```
-- **Upload interval** (default 20 seconds):
+- **Upload interval** (default 20 seconds, keep ≥ 15 s on a free ThingSpeak account):
   ```cpp
   static const uint32_t UPLOAD_INTERVAL_MS = 20000;
   ```
+- **Freshness limits** (older readings are treated as missing):
+  ```cpp
+  static const uint32_t SHT_STALE_MS  = 5000;
+  static const uint32_t VOC_STALE_MS  = 5000;
+  static const uint32_t HCHO_STALE_MS = 10000;
+  static const uint32_t PMS_STALE_MS  = 20000;
+  static const uint32_t CO2_STALE_US  = 3000000;
+  ```
 
 ### TVOC scaling (VOC Index ÷ 5)
-This project converts Sensirion’s **VOC Index** to a 0–100-like scale:
+This project converts Sensirion’s **VOC Index** to a 0–100-like scale, and only once the index is valid (no `0` is sent during warm-up):
 - Upload:
   ```cpp
-  + "&field3=" + String(tvoc/5)
+  if (vocValid()) appendField(body, 3, String(lastVocIndex / 5));
   ```
-- Serial log:
-  ```cpp
-  Serial.print(lastVocIndex/5);
-  ```
+- Serial log: `-` is printed for any value that is not currently valid.
 
 **Interpretation suggestion (scaled TVOC = VOC Index ÷ 5)**
 - 0–20: clean / baseline

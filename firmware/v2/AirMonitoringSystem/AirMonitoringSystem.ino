@@ -25,9 +25,15 @@
 
 static const char* THINGSPEAK_UPDATE_URL = "https://api.thingspeak.com/update";
 
-// ThingSpeak 제한 고려: 15초 이상 권장 -> 20초
+// ThingSpeak 무료 계정은 채널당 15초에 1회까지 -> 여유를 두고 20초
 static const uint32_t UPLOAD_INTERVAL_MS = 20000;
 static uint32_t lastUploadMs = 0;
+
+// WiFi 재접속은 연결을 기다리지 않고 30초 간격으로만 재시도(측정 루프를 막지 않음)
+static const uint32_t WIFI_RETRY_MS = 30000;
+static uint32_t wifiLastAttemptMs = 0;
+static bool wifiAttempted = false;
+static bool wifiWasConnected = false;
 
 // =====================
 // I2C (SHT41 + SGP41)
@@ -40,6 +46,10 @@ SensirionI2CSgp41 sgp41;
 SensirionI2cSht4x sht4x;
 VOCGasIndexAlgorithm vocAlgo;
 
+// Sensirion VOC 알고리즘은 시작 후 45초(blackout) 동안 0을 출력 -> 그 뒤 값만 유효
+static const uint32_t VOC_BLACKOUT_SAMPLES = 46;
+static uint32_t vocAlgoSamples = 0;
+
 // =====================
 // HCHO (UART2)
 // =====================
@@ -47,9 +57,6 @@ static const int HCHO_RX = 16;   // 센서 TX -> ESP32 RX2
 static const int HCHO_TX = 17;   // (옵션) ESP32 TX2 -> 센서 RX
 HardwareSerial HCHO(2);
 DFRobotHCHOSensor hchoSensor(&HCHO);
-
-static bool  hasHcho = false;
-static float lastHchoPpb = NAN;
 
 // =====================
 // PMS7003 (UART1, Passive)
@@ -60,20 +67,20 @@ HardwareSerial pmsSerial(1);
 PMS pms(pmsSerial);
 PMS::DATA pmsData;
 
-static bool hasPms = false;
-static PMS::DATA lastPmsData;
-
 static const uint32_t PMS_INTERVAL_MS = 5000;  // 5초마다 1회 요청
 static const uint32_t PMS_WAIT_MS     = 900;   // 요청 후 최대 0.9초 동안 수신 시도
+static const uint8_t  PMS_MAX_MISSES  = 3;     // 연속 무응답 시 passive 명령 재전송
 static uint32_t pmsLastReqMs = 0;
 static uint32_t pmsReqStartMs = 0;
 static bool pmsWaiting = false;
+static uint8_t pmsMisses = 0;
 
 // =====================
 // MH-Z16 (PWM)
 // =====================
 static const int CO2_PWM_PIN = 33;          // MH-Z16 PWM -> GPIO33
 static const int CO2_FULL_SCALE_PPM = 5000; // 센서 범위(2000/5000/10000 등)로 수정
+static const uint32_t CO2_STALE_US = 3000000; // PWM 주기 약 1초 -> 3초간 상승 엣지가 없으면 결측
 
 volatile uint32_t co2LastRiseUs = 0;
 volatile uint32_t co2PeriodUs = 0;
@@ -102,16 +109,34 @@ static uint32_t lastTick = 0;
 static uint32_t t0 = 0;
 
 // =====================
-// Latest cache (업로드용)
+// Latest cache (업로드용) + 마지막 수신 시각
 // =====================
+// 최근에 받은 값만 유효: 센서가 빠지거나 고장 나면 마지막 값을 계속 올리지 않고 결측 처리
+static const uint32_t SHT_STALE_MS  = 5000;   // 1초마다 측정
+static const uint32_t VOC_STALE_MS  = 5000;   // 1초마다 측정
+static const uint32_t HCHO_STALE_MS = 10000;  // 센서가 약 1초마다 송출
+static const uint32_t PMS_STALE_MS  = 20000;  // 5초마다 요청
+
 static float lastTempC = NAN;
 static float lastRhPct = NAN;
-static int   lastVocIndex = -1;   // field3에 업로드(=TVOC 역할)
+static int   lastVocIndex = -1;   // field3에 업로드(=TVOC 역할, ÷5)
+static float lastHchoPpb = NAN;
 static int   lastPm1 = -1, lastPm25 = -1, lastPm10 = -1;
+
+static uint32_t shtMs = 0, vocMs = 0, hchoMs = 0, pmsMs = 0;  // 마지막 수신 시각(0 = 아직 없음)
 
 // =====================
 // Helpers
 // =====================
+static bool isFresh(uint32_t receivedMs, uint32_t maxAgeMs) {
+  return receivedMs != 0 && millis() - receivedMs <= maxAgeMs;
+}
+
+static bool shtValid()  { return isFresh(shtMs, SHT_STALE_MS); }
+static bool vocValid()  { return isFresh(vocMs, VOC_STALE_MS); }
+static bool hchoValid() { return isFresh(hchoMs, HCHO_STALE_MS); }
+static bool pmsValid()  { return isFresh(pmsMs, PMS_STALE_MS); }
+
 static uint16_t rhToTicks(float rh_percent) {
   if (rh_percent < 0) rh_percent = 0;
   if (rh_percent > 100) rh_percent = 100;
@@ -124,7 +149,17 @@ static uint16_t tToTicks(float t_c) {
   return (uint16_t)((((t_c + 45.0f) * 65535.0f) / 175.0f) + 0.5f);
 }
 
-// PMS 패시브 요청 + 논블로킹 수신 시도
+static void printOrDash(bool valid, float value, int digits) {
+  if (valid) Serial.print(value, digits);
+  else Serial.print('-');
+}
+
+static void printOrDash(bool valid, long value) {
+  if (valid) Serial.print(value);
+  else Serial.print('-');
+}
+
+// PMS 패시브 요청 + 논블로킹 수신
 static void pmsTask() {
   uint32_t now = millis();
 
@@ -136,31 +171,45 @@ static void pmsTask() {
     pmsLastReqMs = now;
   }
 
-  if (pmsWaiting) {
-    if (pms.read(pmsData)) {
-      lastPmsData = pmsData;
-      hasPms = true;
-      pmsWaiting = false;
+  if (!pmsWaiting) return;
 
-      // 업로드 캐시 갱신
-      lastPm1  = (int)lastPmsData.PM_AE_UG_1_0;
-      lastPm25 = (int)lastPmsData.PM_AE_UG_2_5;
-      lastPm10 = (int)lastPmsData.PM_AE_UG_10_0;
-    } else if (now - pmsReqStartMs > PMS_WAIT_MS) {
+  // PMS 라이브러리 read()는 호출 1회에 1바이트만 처리 -> 쌓인 바이트를 한 번에 소진
+  // (업로드 등으로 loop가 늦어져도 버퍼에 도착한 프레임을 놓치지 않음)
+  while (pmsSerial.available()) {
+    if (pms.read(pmsData)) {
+      lastPm1  = (int)pmsData.PM_AE_UG_1_0;
+      lastPm25 = (int)pmsData.PM_AE_UG_2_5;
+      lastPm10 = (int)pmsData.PM_AE_UG_10_0;
+      pmsMs = now;
       pmsWaiting = false;
+      pmsMisses = 0;
+      return;
+    }
+  }
+
+  if (now - pmsReqStartMs > PMS_WAIT_MS) {
+    pmsWaiting = false;
+    // 부팅 직후 passive 명령을 센서가 놓쳤을 수 있으므로 연속 무응답이면 다시 보낸다
+    if (++pmsMisses >= PMS_MAX_MISSES) {
+      Serial.println("PMS7003: no response, re-sending passive mode");
+      pms.passiveMode();
+      pmsMisses = 0;
     }
   }
 }
 
 // CO2(PWM) 캡처값을 ppm으로 변환해서 캐시(1초마다 호출 권장)
 static void co2UpdateOncePerSecond() {
-  uint32_t pUs, hUs;
+  uint32_t pUs, hUs, riseUs;
   noInterrupts();
   pUs = co2PeriodUs;
   hUs = co2HighUs;
+  riseUs = co2LastRiseUs;
   interrupts();
 
-  if (pUs < 900000 || pUs > 1100000 || hUs == 0) {
+  // 마지막 상승 엣지가 오래됐으면(센서 분리·고장) 이전 측정값을 쓰지 않는다
+  bool fresh = (riseUs != 0) && (micros() - riseUs <= CO2_STALE_US);
+  if (!fresh || pUs < 900000 || pUs > 1100000 || hUs == 0) {
     hasCo2 = false;
     lastCo2Ppm = -1;
     return;
@@ -184,54 +233,75 @@ static void co2UpdateOncePerSecond() {
 // WiFi + ThingSpeak
 // =====================
 static void ensureWiFi() {
-  if (WiFi.status() == WL_CONNECTED) return;
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!wifiWasConnected) {
+      wifiWasConnected = true;
+      Serial.print("WiFi OK, IP=");
+      Serial.println(WiFi.localIP());
+    }
+    return;
+  }
+  if (wifiWasConnected) {
+    wifiWasConnected = false;
+    Serial.println("WiFi disconnected");
+  }
+
+  // 연결 완료를 기다리지 않는다: 시도만 하고 반환, 30초 뒤에도 끊겨 있으면 다시 시도
+  uint32_t now = millis();
+  if (wifiAttempted && now - wifiLastAttemptMs < WIFI_RETRY_MS) return;
 
   Serial.print("WiFi connecting to ");
   Serial.println(WIFI_SSID);
-
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-
-  uint32_t tStart = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - tStart < 15000) {
-    delay(300);
-    Serial.print(".");
-  }
-  Serial.println();
-
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.print("WiFi OK, IP=");
-    Serial.println(WiFi.localIP());
+  if (!wifiAttempted) {
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   } else {
-    Serial.println("WiFi connect failed (will retry)");
+    WiFi.reconnect();
   }
+  wifiAttempted = true;
+  wifiLastAttemptMs = now;
+}
+
+static void appendField(String& body, int field, const String& value) {
+  body += "&field";
+  body += field;
+  body += "=";
+  body += value;
 }
 
 static void uploadThingSpeak() {
   if (WiFi.status() != WL_CONNECTED) return;
 
-  // 유효하지 않은 값은 -1로 업로드(그래프에서 결측치처럼 처리하기 쉬움)
-  float fTemp = isnan(lastTempC) ? -1.0f : lastTempC;
-  float fHum  = isnan(lastRhPct) ? -1.0f : lastRhPct;
-
-  int tvoc = (lastVocIndex < 0) ? -1 : lastVocIndex; // field3
-  int hcho = (!hasHcho || isnan(lastHchoPpb)) ? -1 : (int)lroundf(lastHchoPpb);
-  int co2  = (!hasCo2 || lastCo2Ppm < 0) ? -1 : lastCo2Ppm;
-
-  int pm1  = (lastPm1  < 0) ? -1 : lastPm1;
-  int pm25 = (lastPm25 < 0) ? -1 : lastPm25;
-  int pm10 = (lastPm10 < 0) ? -1 : lastPm10;
-
+  // 유효한(최근 수신) 값만 보낸다. 결측 필드는 생략 -> ThingSpeak에는 빈값으로 남는다
   // API Key는 URL이 아니라 POST 본문에 넣어 TLS 구간으로만 전송
-  String body = String("api_key=") + THINGSPEAK_WRITE_API_KEY
-              + "&field1=" + String(fTemp, 2)
-              + "&field2=" + String(fHum, 2)
-              + "&field3=" + String(tvoc/5)
-              + "&field4=" + String(hcho)
-              + "&field5=" + String(co2)
-              + "&field6=" + String(pm1)
-              + "&field7=" + String(pm25)
-              + "&field8=" + String(pm10);
+  String body = String("api_key=") + THINGSPEAK_WRITE_API_KEY;
+  int fields = 0;
+  if (shtValid()) {
+    appendField(body, 1, String(lastTempC, 2));
+    appendField(body, 2, String(lastRhPct, 2));
+    fields += 2;
+  }
+  if (vocValid()) {
+    appendField(body, 3, String(lastVocIndex / 5));
+    fields++;
+  }
+  if (hchoValid()) {
+    appendField(body, 4, String(lroundf(lastHchoPpb)));
+    fields++;
+  }
+  if (hasCo2) {
+    appendField(body, 5, String(lastCo2Ppm));
+    fields++;
+  }
+  if (pmsValid()) {
+    appendField(body, 6, String(lastPm1));
+    appendField(body, 7, String(lastPm25));
+    appendField(body, 8, String(lastPm10));
+    fields += 3;
+  }
+  if (fields == 0) {
+    Serial.println("ThingSpeak: no valid data, upload skipped");
+    return;
+  }
 
   WiFiClientSecure client;
   client.setCACert(THINGSPEAK_ROOT_CA);  // 서버 인증서 검증(thingspeak_ca.h)
@@ -245,11 +315,12 @@ static void uploadThingSpeak() {
 
   int httpCode = http.POST(body);
   if (httpCode > 0) {
-    String payload = http.getString(); // 성공 시 entry id(숫자) 반환이 보통
+    String payload = http.getString(); // 성공 시 entry id, 거부 시 "0"
     Serial.print("ThingSpeak HTTP ");
     Serial.print(httpCode);
     Serial.print(", resp=");
-    Serial.println(payload);
+    Serial.print(payload);
+    Serial.println(payload == "0" ? " (rejected: rate limit or invalid key)" : "");
   } else {
     // 음수 코드: 연결 실패(TLS 인증서 검증 실패 포함 -> thingspeak_ca.h 확인)
     Serial.print("ThingSpeak HTTPS failed: ");
@@ -265,7 +336,9 @@ void setup() {
   Serial.begin(115200);
   delay(300);
 
-  // WiFi
+  // WiFi: 연결을 기다리지 않는다(loop의 ensureWiFi가 상태 확인·재시도)
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
   ensureWiFi();
 
   // ---- UART2 (HCHO) ----
@@ -286,21 +359,21 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(CO2_PWM_PIN), onCo2PwmChange, CHANGE);
 
   Serial.println();
-  Serial.println("Output: T(C), RH(%), VOC_Index->field3, HCHO(ppb), CO2(ppm), PM(ug/m3)");
-  Serial.println("SGP41 warmup: first 10 seconds conditioning.");
+  Serial.println("Output: T(C), RH(%), VOC_Index/5->field3, HCHO(ppb), CO2(ppm), PM(ug/m3); '-' = no valid data");
+  Serial.println("SGP41 warmup: 10 s conditioning + 45 s VOC algorithm blackout.");
   Serial.println("PMS7003: passive request every 5 seconds.");
-  Serial.println("ThingSpeak: upload every 20 seconds.");
+  Serial.println("ThingSpeak: HTTPS upload every 20 seconds (invalid fields omitted).");
 }
 
 void loop() {
-  // (0) WiFi 유지
+  // (0) WiFi 유지(논블로킹)
   ensureWiFi();
 
   // (A) HCHO UART: 들어오면 즉시 마지막값 갱신
   if (hchoSensor.available()) {
     float ppm = hchoSensor.uartReadPPM();
     lastHchoPpb = ppm * 1000.0f; // ppm -> ppb
-    hasHcho = true;
+    hchoMs = millis();
   }
 
   // (B) PMS7003 패시브 태스크
@@ -308,9 +381,7 @@ void loop() {
 
   // (C) 1초 틱
   uint32_t now = millis();
-  if (now - lastTick < SAMPLE_MS) {
-    // 업로드 타이밍은 loop에서 따로 체크
-  } else {
+  if (now - lastTick >= SAMPLE_MS) {
     lastTick = now;
 
     if (t0 == 0) t0 = now;
@@ -325,57 +396,64 @@ void loop() {
     if (!err) {
       lastTempC = t;
       lastRhPct = rh;
+      shtMs = now;
     } else {
       Serial.print("ERR SHT4x=");
       Serial.println(err);
     }
 
-    // SHT 값이 유효할 때만 SGP41에 보정값 넣기
-    if (!isnan(lastTempC) && !isnan(lastRhPct)) {
-      uint16_t rhTicks = rhToTicks(lastRhPct);
-      uint16_t tTicks  = tToTicks(lastTempC);
+    // SGP41 보정값: SHT41이 유효하면 실측값, 아니면 Sensirion 기본값(50 %RH, 25 °C)
+    uint16_t rhTicks = 0x8000;
+    uint16_t tTicks  = 0x6666;
+    if (shtValid()) {
+      rhTicks = rhToTicks(lastRhPct);
+      tTicks  = tToTicks(lastTempC);
+    }
 
-      if (elapsed_s < 10) {
-        uint16_t srawVoc = 0;
-        err = sgp41.executeConditioning(rhTicks, tTicks, srawVoc);
-        if (err) {
-          Serial.print("ERR SGP41(cond)=");
-          Serial.println(err);
+    if (elapsed_s < 10) {
+      uint16_t srawVoc = 0;
+      err = sgp41.executeConditioning(rhTicks, tTicks, srawVoc);
+      if (err) {
+        Serial.print("ERR SGP41(cond)=");
+        Serial.println(err);
+      }
+    } else {
+      uint16_t srawVoc = 0, srawNox = 0;
+      err = sgp41.measureRawSignals(rhTicks, tTicks, srawVoc, srawNox);
+      if (!err) {
+        int32_t vocIndex = vocAlgo.process(srawVoc);
+        // 알고리즘 blackout 동안의 0은 측정값이 아니므로 버린다
+        if (++vocAlgoSamples > VOC_BLACKOUT_SAMPLES) {
+          lastVocIndex = (int)vocIndex;
+          vocMs = now;
         }
-        lastVocIndex = -1; // 워밍업 동안은 업로드-출력에서 - 처리
       } else {
-        uint16_t srawVoc = 0, srawNox = 0;
-        err = sgp41.measureRawSignals(rhTicks, tTicks, srawVoc, srawNox);
-        if (!err) {
-          lastVocIndex = (int)vocAlgo.process(srawVoc);
-        } else {
-          Serial.print("ERR SGP41(meas)=");
-          Serial.println(err);
-        }
+        Serial.print("ERR SGP41(meas)=");
+        Serial.println(err);
       }
     }
 
-    // ---- Serial print(디버그) ----
+    // ---- Serial print(디버그) ---- '-' = 유효한 값 없음
     Serial.print("T=");
-    Serial.print(isnan(lastTempC) ? -1 : lastTempC, 2);
+    printOrDash(shtValid(), lastTempC, 2);
     Serial.print(" C, RH=");
-    Serial.print(isnan(lastRhPct) ? -1 : lastRhPct, 2);
-    Serial.print(" %, TVOC(VOC_Index)=");
-    Serial.print(lastVocIndex/5);
+    printOrDash(shtValid(), lastRhPct, 2);
+    Serial.print(" %, TVOC(VOC_Index/5)=");
+    printOrDash(vocValid(), (long)(lastVocIndex / 5));
     Serial.print(", HCHO=");
-    Serial.print((!hasHcho || isnan(lastHchoPpb)) ? -1 : (int)lroundf(lastHchoPpb));
+    printOrDash(hchoValid(), hchoValid() ? lroundf(lastHchoPpb) : 0L);
     Serial.print(" ppb, CO2=");
-    Serial.print((!hasCo2 || lastCo2Ppm < 0) ? -1 : lastCo2Ppm);
+    printOrDash(hasCo2, (long)lastCo2Ppm);
     Serial.print(" ppm, PM1.0=");
-    Serial.print(lastPm1);
+    printOrDash(pmsValid(), (long)lastPm1);
     Serial.print(" ug/m3, PM2.5=");
-    Serial.print(lastPm25);
+    printOrDash(pmsValid(), (long)lastPm25);
     Serial.print(" ug/m3, PM10=");
-    Serial.print(lastPm10);
+    printOrDash(pmsValid(), (long)lastPm10);
     Serial.println(" ug/m3");
   }
 
-  // (D) ThingSpeak 업로드(20초마다)
+  // (E) ThingSpeak 업로드(20초마다)
   if (millis() - lastUploadMs >= UPLOAD_INTERVAL_MS) {
     lastUploadMs = millis();
     uploadThingSpeak();
