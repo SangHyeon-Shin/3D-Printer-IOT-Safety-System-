@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 
 #include <DFRobotHCHOSensor.h>
@@ -12,12 +13,17 @@
 #include "PMS.h"
 
 // =====================
-// ThingSpeak / WiFi (그대로 유지)
+// ThingSpeak / WiFi
 // =====================
-char ssid[] = "U+Net3AEC";
-char pass[] = "F5A73B6H#F";
-const char* thingspeakServer = "api.thingspeak.com";
-const char* apiKey = "3T9AVUGRL8TAOOIZ";
+// 자격 증명은 저장소에 두지 않는다: secrets.example.h를 secrets.h로 복사해 값을 채운다(.gitignore 대상)
+#if __has_include("secrets.h")
+#include "secrets.h"
+#else
+#error "secrets.h not found: copy secrets.example.h to secrets.h and fill in your credentials"
+#endif
+#include "thingspeak_ca.h"
+
+static const char* THINGSPEAK_UPDATE_URL = "https://api.thingspeak.com/update";
 
 // ThingSpeak 제한 고려: 15초 이상 권장 -> 20초
 static const uint32_t UPLOAD_INTERVAL_MS = 20000;
@@ -181,10 +187,10 @@ static void ensureWiFi() {
   if (WiFi.status() == WL_CONNECTED) return;
 
   Serial.print("WiFi connecting to ");
-  Serial.println(ssid);
+  Serial.println(WIFI_SSID);
 
   WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, pass);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   uint32_t tStart = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - tStart < 15000) {
@@ -216,20 +222,28 @@ static void uploadThingSpeak() {
   int pm25 = (lastPm25 < 0) ? -1 : lastPm25;
   int pm10 = (lastPm10 < 0) ? -1 : lastPm10;
 
-  String url = String("http://") + thingspeakServer + "/update?api_key=" + apiKey
-             + "&field1=" + String(fTemp, 2)
-             + "&field2=" + String(fHum, 2)
-             + "&field3=" + String(tvoc/5)
-             + "&field4=" + String(hcho)
-             + "&field5=" + String(co2)
-             + "&field6=" + String(pm1)
-             + "&field7=" + String(pm25)
-             + "&field8=" + String(pm10);
+  // API Key는 URL이 아니라 POST 본문에 넣어 TLS 구간으로만 전송
+  String body = String("api_key=") + THINGSPEAK_WRITE_API_KEY
+              + "&field1=" + String(fTemp, 2)
+              + "&field2=" + String(fHum, 2)
+              + "&field3=" + String(tvoc/5)
+              + "&field4=" + String(hcho)
+              + "&field5=" + String(co2)
+              + "&field6=" + String(pm1)
+              + "&field7=" + String(pm25)
+              + "&field8=" + String(pm10);
+
+  WiFiClientSecure client;
+  client.setCACert(THINGSPEAK_ROOT_CA);  // 서버 인증서 검증(thingspeak_ca.h)
 
   HTTPClient http;
-  http.begin(url);
+  if (!http.begin(client, THINGSPEAK_UPDATE_URL)) {
+    Serial.println("ThingSpeak: HTTPS begin failed");
+    return;
+  }
+  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
 
-  int httpCode = http.GET();
+  int httpCode = http.POST(body);
   if (httpCode > 0) {
     String payload = http.getString(); // 성공 시 entry id(숫자) 반환이 보통
     Serial.print("ThingSpeak HTTP ");
@@ -237,8 +251,9 @@ static void uploadThingSpeak() {
     Serial.print(", resp=");
     Serial.println(payload);
   } else {
-    Serial.print("ThingSpeak HTTP failed, code=");
-    Serial.println(httpCode);
+    // 음수 코드: 연결 실패(TLS 인증서 검증 실패 포함 -> thingspeak_ca.h 확인)
+    Serial.print("ThingSpeak HTTPS failed: ");
+    Serial.println(HTTPClient::errorToString(httpCode));
   }
   http.end();
 }

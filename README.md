@@ -102,8 +102,22 @@ When Wi‑Fi transmits, the ESP32 current spikes can trigger **brownouts** if th
 
 ## Firmware
 
-### File
-- `Sensor_Thingspeak.ino`
+### Files
+- `firmware/v2/AirMonitoringSystem/AirMonitoringSystem.ino` — sketch
+- `firmware/v2/AirMonitoringSystem/secrets.example.h` — credential template (copy to `secrets.h`)
+- `firmware/v2/AirMonitoringSystem/thingspeak_ca.h` — root CA used to verify `api.thingspeak.com`
+
+### Credentials (required)
+Wi-Fi and ThingSpeak credentials are **not** stored in this repository.
+
+1. Copy `secrets.example.h` to `secrets.h` in the same folder.
+2. Fill in `WIFI_SSID`, `WIFI_PASSWORD` and `THINGSPEAK_WRITE_API_KEY`.
+3. `secrets.h` is ignored by Git (`.gitignore`) — never commit it. The build stops with an error if it is missing.
+
+Uploads go to `https://api.thingspeak.com/update` as an HTTPS `POST`. The Write API Key travels in the request body (not in the URL), and the server certificate is verified against the root CA in `thingspeak_ca.h` (DigiCert Global Root G2).
+If the serial log shows `ThingSpeak HTTPS failed`, ThingSpeak may have changed its certificate chain: export the root certificate of `api.thingspeak.com` from a browser as PEM and replace it in `thingspeak_ca.h`.
+
+> If credentials were ever committed or shared, treat them as leaked: regenerate the ThingSpeak Write API Key (*Channel → API Keys → Generate New Write API Key*) and change the Wi-Fi password.
 
 ### Configs you may change
 - **CO₂ full-scale** (your setting):
@@ -152,6 +166,7 @@ Install via Arduino Library Manager (or include in `libraries/`):
 
 ESP32 core includes:
 - `WiFi.h`
+- `WiFiClientSecure.h`
 - `HTTPClient.h`
 - `Wire.h`
 
@@ -162,8 +177,9 @@ ESP32 core includes:
 1. Install **ESP32** board package.
 2. Board: **ESP32 Dev Module** (or your DevKitC V4 equivalent).
 3. Select the correct **COM port**.
-4. Open `Sensor_Thingspeak.ino` and upload.
-5. Open Serial Monitor at **115200 baud**.
+4. Create `secrets.h` (see *Credentials*).
+5. Open `firmware/v2/AirMonitoringSystem/AirMonitoringSystem.ino` and upload.
+6. Open Serial Monitor at **115200 baud**.
 
 ---
 
